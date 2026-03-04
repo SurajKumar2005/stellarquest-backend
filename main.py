@@ -12,7 +12,6 @@ import numpy as np
 import joblib
 import os
 
-
 # ----------------------------
 # FastAPI App
 # ----------------------------
@@ -27,27 +26,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ----------------------------
-# Load Models (SAFE)
-# ----------------------------
-
-try:
-    reg_model = joblib.load("regression_model.pkl")
-    clf_model = joblib.load("classification_model.pkl")
-except Exception as e:
-    print("Model loading failed:", e)
-    reg_model = None
-    clf_model = None
+reg_model = None
+clf_model = None
 
 
 # ----------------------------
-# Startup Event (DB tables)
+# Startup Event
 # ----------------------------
 
 @app.on_event("startup")
 def startup():
-    models.Base.metadata.create_all(bind=database.engine)
+
+    global reg_model, clf_model
+
+    # Load ML models
+    try:
+        reg_model = joblib.load("regression_model.pkl")
+        clf_model = joblib.load("classification_model.pkl")
+        print("✅ Models loaded successfully")
+    except Exception as e:
+        print("❌ Model loading failed:", e)
+
+    # Initialize database
+    try:
+        models.Base.metadata.create_all(bind=database.engine)
+        print("✅ Database connected successfully")
+    except Exception as e:
+        print("❌ Database initialization failed:", e)
 
 
 # ----------------------------
@@ -96,7 +101,7 @@ def predict(data: StellarInput, db: Session = Depends(database.get_db)):
     if all(v is None for v in input_dict.values()):
         raise HTTPException(
             status_code=400,
-            detail="At least one feature must be provided for prediction."
+            detail="At least one feature must be provided."
         )
 
     try:
@@ -122,12 +127,11 @@ def predict(data: StellarInput, db: Session = Depends(database.get_db)):
 
         db.add(db_record)
         db.commit()
-        db.refresh(db_record)
 
         return {
-            "predicted_planet_radius": round(predicted_radius,4),
+            "predicted_planet_radius": round(predicted_radius, 4),
             "habitability_class": label,
-            "habitability_probability": round(probability,4)
+            "habitability_probability": round(probability, 4)
         }
 
     except Exception as e:
@@ -142,6 +146,7 @@ def predict(data: StellarInput, db: Session = Depends(database.get_db)):
 def get_prediction_history(page: int = 1, limit: int = 5, db: Session = Depends(database.get_db)):
 
     offset = (page - 1) * limit
+
     total_count = db.query(models.PredictionHistory).count()
 
     history_records = (
@@ -161,17 +166,29 @@ def get_prediction_history(page: int = 1, limit: int = 5, db: Session = Depends(
 
 
 # ----------------------------
-# Frontend Serving
+# Root API Check
 # ----------------------------
 
-app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+@app.get("/api")
+def health():
+    return {"status": "API running"}
 
-@app.get("/")
-async def serve_frontend():
-    return FileResponse("index.html")
 
-@app.get("/{catchall:path}")
-async def serve_spa(catchall: str):
-    if os.path.isfile(catchall):
-        return FileResponse(catchall)
-    return FileResponse("index.html")
+# ----------------------------
+# Frontend Serving (safe)
+# ----------------------------
+
+if os.path.isdir("assets"):
+    app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+
+if os.path.isfile("index.html"):
+
+    @app.get("/")
+    async def serve_frontend():
+        return FileResponse("index.html")
+
+    @app.get("/{catchall:path}")
+    async def serve_spa(catchall: str):
+        if os.path.isfile(catchall):
+            return FileResponse(catchall)
+        return FileResponse("index.html")

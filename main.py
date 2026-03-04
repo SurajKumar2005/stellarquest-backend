@@ -14,18 +14,8 @@ import os
 
 
 # ----------------------------
-# Load Models
-# ----------------------------
-
-reg_model = joblib.load("regression_model.pkl")
-clf_model = joblib.load("classification_model.pkl")
-
-
-# ----------------------------
 # FastAPI App
 # ----------------------------
-
-models.Base.metadata.create_all(bind=database.engine)
 
 app = FastAPI(title="Stellar Prediction API")
 
@@ -36,6 +26,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ----------------------------
+# Load Models (SAFE)
+# ----------------------------
+
+try:
+    reg_model = joblib.load("regression_model.pkl")
+    clf_model = joblib.load("classification_model.pkl")
+except Exception as e:
+    print("Model loading failed:", e)
+    reg_model = None
+    clf_model = None
+
+
+# ----------------------------
+# Startup Event (DB tables)
+# ----------------------------
+
+@app.on_event("startup")
+def startup():
+    models.Base.metadata.create_all(bind=database.engine)
 
 
 # ----------------------------
@@ -74,12 +86,13 @@ class StellarInput(BaseModel):
 # ----------------------------
 
 @app.post("/predict")
-
 def predict(data: StellarInput, db: Session = Depends(database.get_db)):
+
+    if reg_model is None or clf_model is None:
+        raise HTTPException(status_code=500, detail="Models not loaded")
 
     input_dict = data.dict()
 
-    # 🚨 Safety Check: Prevent completely empty input
     if all(v is None for v in input_dict.values()):
         raise HTTPException(
             status_code=400,
@@ -88,91 +101,38 @@ def predict(data: StellarInput, db: Session = Depends(database.get_db)):
 
     try:
 
-        # Convert to DataFrame
         input_df = pd.DataFrame([input_dict])
-
-        # Fill missing values with np.nan so the model's pipeline imputer can handle them
         input_df = input_df.fillna(np.nan)
-
-        # Ensure correct feature order
         input_df = input_df[reg_model.feature_names_in_]
 
-        # -----------------------
-        # Regression Prediction
-        # -----------------------
-
         pred_log = reg_model.predict(input_df)
-
         predicted_radius = float(np.expm1(pred_log)[0])
 
-
-        # -----------------------
-        # Classification
-        # -----------------------
-
         class_pred = int(clf_model.predict(input_df)[0])
-
         probability = float(clf_model.predict_proba(input_df)[0][1])
 
-
-        # Convert label
-        if class_pred == 1:
-            label = "Confirmed"
-        else:
-            label = "False Positive"
-
-        # -----------------------
-        # Database Insertion
-        # -----------------------
+        label = "Confirmed" if class_pred == 1 else "False Positive"
 
         db_record = models.PredictionHistory(
-            koi_period=input_dict.get("koi_period"),
-            koi_duration=input_dict.get("koi_duration"),
-            koi_depth=input_dict.get("koi_depth"),
-            koi_impact=input_dict.get("koi_impact"),
-            koi_model_snr=input_dict.get("koi_model_snr"),
-            koi_num_transits=input_dict.get("koi_num_transits"),
-            koi_ror=input_dict.get("koi_ror"),
-            st_teff=input_dict.get("st_teff"),
-            st_logg=input_dict.get("st_logg"),
-            st_met=input_dict.get("st_met"),
-            st_mass=input_dict.get("st_mass"),
-            st_radius=input_dict.get("st_radius"),
-            st_dens=input_dict.get("st_dens"),
-            teff_err1=input_dict.get("teff_err1"),
-            teff_err2=input_dict.get("teff_err2"),
-            logg_err1=input_dict.get("logg_err1"),
-            logg_err2=input_dict.get("logg_err2"),
-            feh_err1=input_dict.get("feh_err1"),
-            feh_err2=input_dict.get("feh_err2"),
-            mass_err1=input_dict.get("mass_err1"),
-            mass_err2=input_dict.get("mass_err2"),
-            radius_err1=input_dict.get("radius_err1"),
-            radius_err2=input_dict.get("radius_err2"),
-            predicted_radius=float(predicted_radius),
+            **input_dict,
+            predicted_radius=predicted_radius,
             habitability_class=label,
-            confidence=float(probability)
+            confidence=probability
         )
+
         db.add(db_record)
         db.commit()
         db.refresh(db_record)
 
         return {
-
             "predicted_planet_radius": round(predicted_radius,4),
-
             "habitability_class": label,
-
             "habitability_probability": round(probability,4)
-
         }
 
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}"
-        )
 
 # ----------------------------
 # History Endpoint
@@ -180,12 +140,10 @@ def predict(data: StellarInput, db: Session = Depends(database.get_db)):
 
 @app.get("/history")
 def get_prediction_history(page: int = 1, limit: int = 5, db: Session = Depends(database.get_db)):
+
     offset = (page - 1) * limit
-    
-    # Get total count for frontend pagination math
     total_count = db.query(models.PredictionHistory).count()
-    
-    # Query descending rows with offset
+
     history_records = (
         db.query(models.PredictionHistory)
         .order_by(models.PredictionHistory.timestamp.desc())
@@ -193,7 +151,7 @@ def get_prediction_history(page: int = 1, limit: int = 5, db: Session = Depends(
         .limit(limit)
         .all()
     )
-    
+
     return {
         "data": history_records,
         "total": total_count,
@@ -201,26 +159,19 @@ def get_prediction_history(page: int = 1, limit: int = 5, db: Session = Depends(
         "limit": limit
     }
 
+
 # ----------------------------
 # Frontend Serving
 # ----------------------------
 
-# Serve static assets (JS, CSS) from the 'assets' folder
 app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
-# Serve the index.html for the root route
 @app.get("/")
 async def serve_frontend():
     return FileResponse("index.html")
-    
+
 @app.get("/{catchall:path}")
 async def serve_spa(catchall: str):
-    """Fallback route for SPA navigation"""
     if os.path.isfile(catchall):
         return FileResponse(catchall)
     return FileResponse("index.html")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
